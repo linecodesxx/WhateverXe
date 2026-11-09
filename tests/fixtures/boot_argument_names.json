@@ -145,8 +145,12 @@
   "-wex-noaccel": [],
   "-wex-display-trace": [],
   "-wex-adlp-readout": [],
+  "-wex-no-va-renderer": [],
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
   "-wex-dsi-hdmi-test": [],
-  "-wex-dsi-power-test": []
+  "-wex-dsi-power-test": [],
+  "-wex-rpl-edp-ctl2-bit3": [],
+  "-wex-rpl-edp-mode0": [],
+  "-wex-rpl-cdclk-diag": []
 }
