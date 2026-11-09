@@ -107,6 +107,14 @@ extern "C" __attribute__((naked,used)) void tglHangPreStopBridge() {
  // Extra argument registers are caller-saved; retain the original return address.
  asm volatile("movl %r14d, %ecx\nmovq %r15, %r8\njmp _tglHangPreStopWake\n");
 }
+// Private, bounded diagnostics for the physical A7A0/rev04 Tahoe mode-0 test.
+// Log CPU snapshots and existing operation results only; never sample MMIO here.
+static bool wexRplClockDiag;
+static uint32_t wexRplClockDiagCounts[6] {};
+static bool wexClockDiagTake(unsigned event) {
+    return wexRplClockDiag && event<6 &&
+        __atomic_fetch_add(&wexRplClockDiagCounts[event],1,__ATOMIC_RELAXED)<32;
+}
 static bool tglHangPreStopReady=false;
 static uint32_t tglHangPreStopState;
 static TGLHangPreStop::Capture tglHangPreStopCapture{};
@@ -4386,6 +4394,19 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
+    const bool rplEDPRequested=checkKernelArgument("-wex-rpl-edp-ctl2-bit3");
+    AlderLakeN::configureRplEDPCTL2Bit3(xeProfile.identity,xeProfile.revision,
+        XELP::kernelOS(version)==XELP::OS::Tahoe,rplEDPRequested);
+    if(physicalGPU)physicalGPU->setProperty("WEXExperimentalRplEDPCTL2Bit3",AlderLakeN::rplEDPCTL2Bit3Policy());
+    AlderLakeN::configureRplEDPMode0(xeProfile.identity,xeProfile.revision,
+        XELP::kernelOS(version)==XELP::OS::Tahoe,checkKernelArgument("-wex-rpl-edp-mode0"));
+    if(physicalGPU)physicalGPU->setProperty("WEXExperimentalRplEDPMode0",AlderLakeN::rplEDPMode0Policy());
+    wexRplClockDiag=AlderLakeN::rplEDPMode0Policy() && checkKernelArgument("-wex-rpl-cdclk-diag");
+    if(wexRplClockDiag) {
+        if(physicalGPU)physicalGPU->setProperty("WEXRplClockDiagnosticBuild","WEX-RPL-FIXES-v2");
+        IOLog("WEX-CDCLK-DIAG-v1: START physical=0x%x revision=%u mode0=1 logging-only=1\n",xeProfile.identity,unsigned(xeProfile.revision));
+    }
+
     // ADLP_LOAD_ONLY_KERNEL: do not enter TGL MMIO/FIA, bootstrap or VM setup.
     const auto physicalEntry=XELP::deviceEntry(xeProfile.identity);
     adlpLoadOnly=physicalEntry && xeProfile.mobileDisplay13() &&
@@ -4925,6 +4946,12 @@ static void adlnFault(bool &flag,uint32_t line,uint32_t status=UINT32_MAX) {
         r[26]=display13FBIRQ.handlers;r[27]=display13FBIRQ.quiescing;r[28]=c.bridge.begun;r[29]=c.bridge.state.suspended;
         r[30]=c.bridge.pgRefs[0];r[31]=c.bridge.pgRefs[2];
         IORegistryEntry::getRegistryRoot()->setProperty("N97FBFirstResourceFault",r,sizeof(r));
+        // Persist the first failure without sampling hardware or exposing pointers.
+        // Only active for the separately enabled experimental mode0 path.
+        if(AlderLakeN::rplEDPMode0Policy())IOLog("WEX first-fault: line=%u status=0x%x bridge=%u memory=%u clock=%u panel=%u dbuf=%u wm=%u cdclkStatus=%u cdclkKHz=%u engine=%u adopted=%u port=%u\n",
+            line,status,unsigned(c.bridge.state.faulted),unsigned(c.memoryFaulted),unsigned(c.clockFaulted),
+            unsigned(c.panelFaulted),unsigned(c.dbuf.faulted),unsigned(c.watermarkFaulted),
+            unsigned(c.clock.status),c.clock.cdclkKHz,unsigned(c.engineEnabled),unsigned(c.bridge.bootAdopted),c.bridge.bootPort);
     }
     flag=true;
 }
@@ -7629,7 +7656,8 @@ uint8_t *XE::display13SSTPort(void *port) {
  auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
  if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
     !(s->adlnOutputWiring.links()&(1U<<config[0])) || p[0x117] ||
-    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) ||
+    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || !AlderLakeN::acceptedRplEDPSSTMode(Display13FBMemory::field<uint32_t>(p,0x550),
+        (config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U),config[0],s->adlnOutputWiring.panel,c.bridge.bootAdopted) ||
     Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
  return p;
 }
@@ -8465,6 +8493,7 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
 	// itself becomes a registered service. Publish only copied CPU evidence at
 	// the root so a rejected handoff remains observable through SSH.
 	uint64_t check[38] {3,sourceBound,adlnIRQOwner(controller),irqSource!=nullptr};
+    uint64_t handoffAudit[24] {1};
 	if(irqSource) {
 		check[4]=irqSource->getProvider()==pci;check[5]=irqSource->getIntIndex();
 		check[6]=irqSource->getWorkLoop()==workLoop;check[7]=irqSource->isEnabled();
@@ -8537,6 +8566,33 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
 				Display13Power::objectAssociations(c.power,0x80,controller,0x1C20);
 		}
 		check[35]=valid;
+        if(valid) {
+            auto config=Display13FBMemory::field<uint32_t *>(port,0x548);
+            auto ddi=c.bridge.bootPort;
+            handoffAudit[1]=port->getMetaClass()->getClassSize();
+            handoffAudit[2]=Display13FBMemory::field<uint32_t>(port,0x550);
+            handoffAudit[3]=Display13FBMemory::field<uint8_t>(port,0x117);
+            handoffAudit[4]=Display13FBMemory::field<uint32_t>(port,0x120);
+            handoffAudit[5]=config ? config[0] : UINT32_MAX;
+            handoffAudit[6]=Display13FBMemory::field<void *>(port,0x578)==c.access;
+            handoffAudit[7]=callbackXE->display13FBSSTHooksReady;
+            handoffAudit[8]=adlnWriterMappingBound();
+            handoffAudit[9]=c.panelFaulted;
+            handoffAudit[10]=c.clockStopped;
+            handoffAudit[11]=c.bridge.bootPGProtected;
+            handoffAudit[12]=c.bridge.bootDDIProtected;
+            handoffAudit[13]=c.bridge.bootAdopted;
+            handoffAudit[14]=c.bridge.pgRefs[0];
+            handoffAudit[15]=ddi<7 ? c.bridge.ddiRefs[ddi] : UINT32_MAX;
+            handoffAudit[16]=ddi<2 ? c.mainLink[ddi].bootPending : false;
+            handoffAudit[17]=ddi<2 ? c.mainLink[ddi].owner!=0 : false;
+            handoffAudit[18]=ddi<2 ? c.mainLink[ddi].port : UINT32_MAX;
+            handoffAudit[19]=ddi<2 ? c.mainLink[ddi].lease.owner==&c.bridge.state : false;
+            handoffAudit[20]=ddi<2 ? c.mainLink[ddi].lease.domains : 0;
+            handoffAudit[21]=ddi;
+            handoffAudit[22]=callbackXE->adlnOutputWiring.panel;
+            handoffAudit[23]=callbackXE->adlnOutputWiring.links();
+        }
 		if(valid) {
 			// Validate the real path and surface before admitting interrupts.
 			// No owner IOLock is held across the IRQ enable/diagnostic property.
@@ -8585,6 +8641,7 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
 	if(result.status!=Display13Power::Status::Complete && adlnIRQOwner(controller))wrapDisplay13FBDisableIRQ(controller);
 	adlnPublishPowerRecord("N97FBBootHandoff",record);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBBootHandoffCheck",check,sizeof(check));
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXRplEDPHandoffAudit",handoffAudit,sizeof(handoffAudit));
 }
 
 bool XE::wrapAlderLakeNScanoutAllocate(IOService *fb) {
@@ -9130,8 +9187,23 @@ void XE::wrapAlderLakeNClockInit(IOService *controller) {
 }
 uint64_t XE::wrapAlderLakeNClockProbe(IOService *controller) {return adlnClockReadout(controller).nativeHz();}
 void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
-	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)) {adlnSetDualClock(controller,nativeHz);return;}
-	auto &c=display13FBPower;if(!c.lock)return;
+    if(wexClockDiagTake(0))IOLog("WEX-CDCLK-DIAG-v1: ROUTE hz=%llu multi=%u panel=0x%x dp=0x%x hdmi=0x%x tc=0x%x\n",
+        nativeHz,unsigned(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)),
+        callbackXE->adlnOutputWiring.panel,callbackXE->adlnOutputWiring.dp,callbackXE->adlnOutputWiring.hdmi,callbackXE->adlnOutputWiring.typeC);
+    auto &c=display13FBPower;
+    bool panelOnly=false;
+    if(AlderLakeN::rplEDPMode0Policy() && c.lock) {
+        IOLockLock(c.lock);
+        panelOnly=c.bridge.bootPort==0 && Display13FBTopology::panelOnlyClock(
+            callbackXE->adlnOutputWiring,c.bridge.bootPort,
+            c.pipe[0].memoryFramebuffer,c.pipe[1].memoryFramebuffer,c.pipe[2].memoryFramebuffer);
+        IOLockUnlock(c.lock);
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXRplPanelOnlyClock",panelOnly);
+    }
+    if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && !panelOnly) {
+        adlnSetDualClock(controller,nativeHz);return;
+    }
+    if(!c.lock)return;
 	Display13Clock::Change result;result.requestedHz=nativeHz;
 	auto fb=c.pipe[0].memoryFramebuffer;
 	auto mutex=fb && fb->getMetaClass()->getClassSize()>=0x4B90 ? Display13FBMemory::field<IORecursiveLock *>(fb,0x4220) : nullptr;
@@ -9180,6 +9252,8 @@ void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
 		}
 	}
 	if(result.status!=Display13Clock::ChangeStatus::Complete)adlnFault(c.clockFaulted,__LINE__);
+	if(wexClockDiagTake(1))IOLog("WEX-CDCLK-DIAG-v1: SINGLE hz=%llu status=%u writes=%u clockFault=%u memoryFault=%u adopted=%u stopped=%u\n",
+        nativeHz,unsigned(result.status),unsigned(result.writes),unsigned(c.clockFaulted),unsigned(c.memoryFaulted),unsigned(c.bridge.bootAdopted),unsigned(c.clockStopped));
 	wmRecord[0]=1;wmRecord[3]=static_cast<uint32_t>(beforeWM.status);wmRecord[4]=static_cast<uint32_t>(afterWM.status);
 	wmRecord[5]=c.pipe[0].watermarkClockHz;
 	IOLockUnlock(c.lock);if(mutex)IORecursiveLockUnlock(mutex);
@@ -9231,6 +9305,9 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
                 if(ready) {acquired=loop;evidence[8]=1;}
             }
         }
+        if(wexClockDiagTake(2))IOLog("WEX-CDCLK-DIAG-v1: DUAL-GATE hz=%llu current=%llu currentStatus=%u valid=%u active=0x%x loop=%u hooks=%u inGate=%u acquired=%u ready=%u adopted=%u stopped=%u frames=%u%u%u\n",
+            nativeHz,current.nativeHz(),unsigned(current.status),unsigned(valid),active,unsigned(evidence[5]),unsigned(evidence[6]),unsigned(evidence[7]),unsigned(evidence[8]),unsigned(ready),
+            unsigned(c.bridge.bootAdopted),unsigned(c.clockStopped),unsigned(c.pipe[0].memoryFramebuffer!=nullptr),unsigned(c.pipe[1].memoryFramebuffer!=nullptr),unsigned(c.pipe[2].memoryFramebuffer!=nullptr));
         if(ready)for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
             auto fb=c.pipe[p].memoryFramebuffer;
             if(!fb || fb->getMetaClass()->getClassSize()<0x4B90) {ready=false;break;}
@@ -9300,6 +9377,8 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
         *reinterpret_cast<uint64_t *>(reinterpret_cast<uint8_t *>(controller)+0xE98)=result.after.nativeHz();
     } else adlnFault(c.clockFaulted,__LINE__);
     evidence[16]=static_cast<uint32_t>(result.status);evidence[17]=result.writes;
+    if(wexClockDiagTake(3))IOLog("WEX-CDCLK-DIAG-v1: DUAL-RESULT hz=%llu status=%u writes=%u active=0x%x actual=0x%x ready=%u locks=0x%x idle=%u cold=%u certified=%u clockFault=%u memoryFault=%u\n",
+        nativeHz,unsigned(result.status),unsigned(result.writes),unsigned(evidence[3]),unsigned(evidence[4]),unsigned(evidence[10]),unsigned(evidence[9]),unsigned(evidence[14]),unsigned(evidence[15]),unsigned(evidence[11]),unsigned(c.clockFaulted),unsigned(c.memoryFaulted));
     for(unsigned p=0;p<3;++p) {
         evidence[18+3*p]=static_cast<uint32_t>(before[p].status);evidence[19+3*p]=static_cast<uint32_t>(after[p].status);
         evidence[20+3*p]=c.pipe[p].watermarkClockHz;
@@ -14333,6 +14412,14 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	if (!that->getProperty("IOGVAHEVCDecode") &&
 	    OSDynamicCast(OSDictionary, that->getProperty("IOGVAHEVCDecodeCapabilities")))
 		that->setProperty("IOGVAHEVCDecode", "2");
+	// AppleGVA opens the VA driver for pixel transfers, and the driver crashes there on a NULL pointer
+	// (AVFPixelProcess_PrepareToTransferImages): VTPixelTransferSession, the camera, mediaanalysisd in a loop.
+	// Hiding this key alone stops it, at a price: Apple's decoder service then finds no renderer and may
+	// decode in software. So only on request.
+	if (checkKernelArgument("-wex-no-va-renderer")) {
+		that->removeProperty("IOVARendererID");
+		SYSLOG("igfx", "IOVARendererID not advertised (-wex-no-va-renderer)");
+	}
 
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {
 		SYSLOG("igfx", "TGL blit scratch parameter mismatch");
@@ -19472,6 +19559,8 @@ uint32_t XE::wrapTGLPixelInfo(void *fb, int mode, int depth, int aperture, void 
 	clock_get_uptime(&uptime); absolutetime_to_nanoseconds(uptime, r);
 	r[1] = mode; r[2] = depth; r[3] = aperture; r[4] = result;
 	r[5] = *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(fb) + 0x4254);
+    if(wexClockDiagTake(4))IOLog("WEX-CDCLK-DIAG-v1: PIXEL fb=%u mode=%d depth=%d aperture=%d result=0x%x state=0x%x\n",
+        *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(fb)+0x1DC),mode,depth,aperture,result,unsigned(r[5]));
 	// Stable 172-byte IOPixelInformation layout, including encoding and masks.
 	if (!result && info) memcpy(r + 6, info, 172);
 	char key[48]; snprintf(key, sizeof(key), "TGLPixelFB%uDepth%d", *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(fb) + 0x1DC), depth);
