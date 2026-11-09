@@ -268,6 +268,13 @@ inline bool sharedReservationAccepted(const SharedReservation &r,uint64_t manage
 // bootScanout=false verifies backing/ownership for a cold allocation without
 // reading any pipe bank or treating the allocation as an active display.
 inline bool apertureRange(const Pool &p,uint32_t base,uint32_t bytes,uint64_t apertureBytes) {
+    // Machine-scoped adaptation of Thatisjigen aperture-0.7.0 and issue #22.
+    // Physical A7A0 rev04, Tahoe and explicit mode0 opt-in only. Never extend the pool.
+    if(AlderLakeN::rplEDPMode0Policy()) {
+        const uint64_t end=uint64_t(base)+((uint64_t(bytes)+4095)&~uint64_t(4095));
+        return bytes && !(bytes&63) && !(base&4095) && base>=p.base &&
+            end<=uint64_t(p.base)+p.bytes && end<=apertureBytes;
+    }
     return bytes && !(base&4095) && !(bytes&4095) && base>=p.base &&
         uint64_t(base)+bytes<=uint64_t(p.base)+p.bytes && uint64_t(base)+bytes<=apertureBytes;
 }

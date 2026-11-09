@@ -16,6 +16,24 @@
 #include "kern_display13_tc.hpp"
 
 namespace AlderLakeN {
+// Experimental, opt-in CPU-side acceptance of one observed firmware state.
+// Initialized during processKernel before display capture; never changes MMIO.
+inline bool &rplEDPCTL2Bit3Policy() { static bool enabled=false; return enabled; }
+inline void configureRplEDPCTL2Bit3(uint32_t physicalIdentity,uint32_t revision,bool tahoe,bool requested) {
+    rplEDPCTL2Bit3Policy()=requested && tahoe && physicalIdentity==0xA7A08086U && revision==4;
+}
+inline bool acceptedDPSourceCTL2(uint32_t ctl2,bool panel,unsigned pipe,unsigned ddi) {
+    return ctl2==0 || (rplEDPCTL2Bit3Policy() && panel && pipe==0 && ddi==0 && ctl2==8);
+}
+// Independent opt-in for the uninitialised Combo A eDP port at boot handoff.
+// Never changes the donor's mode field or permits another mode/port/family.
+inline bool &rplEDPMode0Policy() { static bool enabled=false; return enabled; }
+inline void configureRplEDPMode0(uint32_t physicalIdentity,uint32_t revision,bool tahoe,bool requested) {
+    rplEDPMode0Policy()=requested && tahoe && physicalIdentity==0xA7A08086U && revision==4;
+}
+inline bool acceptedRplEDPSSTMode(uint32_t mode,uint32_t expected,unsigned ddi,uint32_t panelMask,bool bootAdopted) {
+    return mode==expected || (rplEDPMode0Policy() && mode==0 && expected==1 && ddi==0 && (panelMask&1) && !bootAdopted);
+}
 constexpr uint32_t Identity = 0x46D18086;
 constexpr uint32_t DisplayVersion = 13;
 constexpr uint32_t GraphicsStep = 0; // A0, separate stepping domain.
@@ -240,7 +258,7 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
     // preserve it and include it in the unchanged-source check, never clear it
     // on an enabled transcoder or infer an MST transport from that bit alone.
     return (trans&0xFF700000U)==(0x82000000U|((ddi+1)<<27)) &&
-        !(trans&((1U<<15)|(1U<<9))) && !ctl2 &&
+        !(trans&((1U<<15)|(1U<<9))) && acceptedDPSourceCTL2(ctl2,panel,pipe,ddi) &&
         (lanes==1 || lanes==2 || lanes==4) && ((buf>>1)&7)==lanes-1 &&
         (buf&(typeC && tc->ownershipOptional?0x80000080U:0x800000C0U))==
             (typeC && !tc->ownershipOptional?0x80000040U:0x80000000U) &&
